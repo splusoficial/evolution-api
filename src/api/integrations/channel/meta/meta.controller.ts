@@ -1,6 +1,7 @@
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { Logger } from '@config/logger.config';
+import { createJid } from '@utils/createJid';
 import axios from 'axios';
 
 import { ChannelController, ChannelControllerInterface } from '../channel.controller';
@@ -15,6 +16,7 @@ export class MetaController extends ChannelController implements ChannelControll
   integrationEnabled: boolean;
 
   public async receiveWebhook(data: any) {
+    console.log(JSON.stringify(data, null, 2));
     if (data.object === 'whatsapp_business_account') {
       if (data.entry[0]?.changes[0]?.field === 'message_template_status_update') {
         const template = await this.prismaRepository.template.findFirst({
@@ -34,6 +36,52 @@ export class MetaController extends ChannelController implements ChannelControll
           },
         });
         return;
+      } else if (data.entry[0]?.changes[0]?.value.message_echoes) {
+        const numberId = data.entry[0].changes[0].value.metadata.phone_number_id;
+
+        const remoteJid = createJid(data.entry[0]?.changes[0]?.value.message_echoes[0].to);
+
+        if (!numberId) {
+          this.logger.error('WebhookService -> receiveWebhookMeta -> numberId not found');
+          return {
+            status: 'success',
+          };
+        }
+
+        const instance = await this.prismaRepository.instance.findFirst({
+          where: { number: numberId },
+          include: {
+            OpenaiSetting: true,
+          },
+        });
+
+        if (!instance) {
+          this.logger.error('WebhookService -> receiveWebhookMeta -> instance not found');
+          return {
+            status: 'success',
+          };
+        }
+
+        if (instance.OpenaiSetting.stopBotFromMe) {
+          // consult if exist session to remoteJid if exist update IntegrationSession to paused
+          const session = await this.prismaRepository.integrationSession.findFirst({
+            where: {
+              remoteJid: remoteJid,
+              instanceId: instance.id,
+            },
+          });
+
+          if (session) {
+            await this.prismaRepository.integrationSession.update({
+              where: { id: session.id },
+              data: { status: 'paused' },
+            });
+          }
+        }
+
+        return {
+          status: 'success',
+        };
       }
 
       data.entry?.forEach(async (entry: any) => {

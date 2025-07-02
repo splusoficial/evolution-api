@@ -157,20 +157,28 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         return;
       }
 
-      // If session exists but is paused
-      if (session.status === 'paused') {
-        await this.prismaRepository.integrationSession.update({
-          where: {
-            id: session.id,
-          },
-          data: {
-            status: 'opened',
-            awaitUser: true,
-          },
-        });
+      // // If session exists but is paused
+      // if (session.status === 'paused') {
+      //   await this.prismaRepository.integrationSession.update({
+      //     where: {
+      //       id: session.id,
+      //     },
+      //     data: {
+      //       status: 'opened',
+      //       awaitUser: true,
+      //     },
+      //   });
 
-        return;
-      }
+      //   return;
+      // }
+
+      session = await this.prismaRepository.integrationSession.findFirst({
+        where: {
+          id: session.id,
+        },
+      });
+
+      console.log(`Integration session found: ${JSON.stringify(session)}`);
 
       // Process with the appropriate API based on bot type
       await this.sendMessageToBot(instance, session, settings, openaiBot, remoteJid, pushName || '', content);
@@ -230,6 +238,11 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
 
       this.logger.log(`Got response from OpenAI: ${message?.substring(0, 50)}${message?.length > 50 ? '...' : ''}`);
 
+      if (session?.status !== 'opened') {
+        this.logger.warn(`Session is not opened, current status: ${session?.status}`);
+        return;
+      }
+
       // Send the response
       if (message) {
         this.logger.log('Sending message to WhatsApp');
@@ -238,16 +251,16 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         this.logger.error('No message to send to WhatsApp');
       }
 
-      // Update session status
-      await this.prismaRepository.integrationSession.update({
-        where: {
-          id: session.id,
-        },
-        data: {
-          status: 'opened',
-          awaitUser: true,
-        },
-      });
+      // // Update session status
+      // await this.prismaRepository.integrationSession.update({
+      //   where: {
+      //     id: session.id,
+      //   },
+      //   data: {
+      //     status: 'opened',
+      //     awaitUser: true,
+      //   },
+      // });
     } catch (error) {
       this.logger.error(`Error in sendMessageToBot: ${error.message || JSON.stringify(error)}`);
       if (error.response) {
@@ -309,6 +322,9 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
       });
       this.logger.log(`Created new thread ID: ${threadId} for session: ${session.id}`);
     }
+
+    // Wait for any active runs to complete before proceeding
+    await this.waitForActiveRuns(threadId);
 
     // Add message to thread
     await this.client.beta.threads.messages.create(threadId, messageData);
@@ -552,6 +568,54 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
   }
 
   /**
+   * Wait for any active runs to complete before proceeding
+   */
+  private async waitForActiveRuns(threadId: string): Promise<void> {
+    try {
+      const runs = await this.client.beta.threads.runs.list(threadId);
+
+      // Check if there are any active runs
+      const activeRuns = runs.data.filter(
+        (run) => run.status === 'in_progress' || run.status === 'queued' || run.status === 'requires_action',
+      );
+
+      if (activeRuns.length > 0) {
+        this.logger.log(`Found ${activeRuns.length} active run(s), waiting for completion...`);
+
+        // Wait for all active runs to complete
+        for (const run of activeRuns) {
+          let maxRetries = 30; // 30 seconds max wait
+          const checkInterval = 1000; // 1 second
+
+          while (maxRetries > 0) {
+            const runStatus = await this.client.beta.threads.runs.retrieve(threadId, run.id);
+
+            if (
+              runStatus.status === 'completed' ||
+              runStatus.status === 'failed' ||
+              runStatus.status === 'cancelled' ||
+              runStatus.status === 'expired'
+            ) {
+              this.logger.log(`Run ${run.id} completed with status: ${runStatus.status}`);
+              break;
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, checkInterval));
+            maxRetries--;
+          }
+
+          if (maxRetries === 0) {
+            this.logger.warn(`Run ${run.id} did not complete within timeout, proceeding anyway`);
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Error checking active runs: ${error}`);
+      // Continue anyway if we can't check runs
+    }
+  }
+
+  /**
    * Wait for and retrieve the AI response
    */
   private async getAIResponse(
@@ -625,9 +689,27 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
     if (status.status === 'completed') {
       const messages = await this.client.beta.threads.messages.list(threadId);
       return messages;
+    } else if (status.status === 'in_progress') {
+      // Se o status ainda está in_progress, aguarda um pouco mais e chama a função recursivamente
+      this.logger.log(`Status still in_progress, waiting and retrying...`);
+      await new Promise((resolve) => setTimeout(resolve, 2000)); // Aguarda 2 segundos
+      return this.getAIResponse(threadId, runId, functionUrl, remoteJid, pushName);
     } else {
       this.logger.error(`Assistant run failed with status: ${status.status}`);
-      return { data: [{ content: [{ text: { value: 'Failed to get a response from the assistant.' } }] }] };
+      return {
+        data: [
+          {
+            content: [
+              {
+                text: {
+                  value:
+                    'sua mensagem ficou assim pra mim: “🕒 Aguardando mensagem. Essa ação pode levar alguns instantes”.. vc consegue me reenvia-la?',
+                },
+              },
+            ],
+          },
+        ],
+      };
     }
   }
 

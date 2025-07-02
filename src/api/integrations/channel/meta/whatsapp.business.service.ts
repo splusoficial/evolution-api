@@ -880,10 +880,34 @@ export class BusinessStartupService extends ChannelStartupService {
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
 
+      const session = await this.prismaRepository.integrationSession.findFirst({
+        where: {
+          remoteJid: this.phoneNumber,
+          instanceId: this.instanceId,
+        },
+      });
+
+      if (session && session.status === 'paused') {
+        this.logger.info(`Sessao ${session.remoteJid} está pausada. Ignorando eventos.`);
+        return;
+      }
+
       // Si hay mensajes, verificar primero el tipo
       if (content.messages && content.messages.length > 0) {
         const message = content.messages[0];
         this.logger.log(`Tipo de mensaje recibido: ${message.type}`);
+
+        //if message.type is sticker or image or video ignore
+        if (
+          message.type === 'sticker' ||
+          message.type === 'image' ||
+          message.type === 'video' ||
+          message.type === 'reaction' ||
+          message.type === 'document'
+        ) {
+          this.logger.warn(`Mensaje de tipo ${message.type} recibido, ignorando procesamiento.`);
+          return;
+        }
 
         // Verificamos el tipo de mensaje antes de procesarlo
         if (
